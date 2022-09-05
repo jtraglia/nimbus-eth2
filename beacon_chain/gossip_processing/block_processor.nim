@@ -18,7 +18,6 @@ import
 
 from ../consensus_object_pools/consensus_manager import
   ConsensusManager, checkNextProposer, optimisticExecutionPayloadHash,
-  runForkchoiceUpdated, runForkchoiceUpdatedDiscardResult,
   runProposalForkchoiceUpdated, shouldSyncOptimistically, updateHead,
   updateHeadWithExecution
 from ../beacon_clock import GetBeaconTimeFn, toFloatSeconds
@@ -80,7 +79,7 @@ type
     # ----------------------------------------------------------------
     consensusManager: ref ConsensusManager
       ## Blockchain DAG, AttestationPool and Quarantine
-      ## Blockchain DAG, AttestationPool, Quarantine, and Eth1Manager
+      ## Blockchain DAG, AttestationPool, Quarantine, and ELManager
     validatorMonitor: ref ValidatorMonitor
     getBeaconTime: GetBeaconTimeFn
 
@@ -186,16 +185,17 @@ proc storeBackfillBlock(
 
 from web3/engine_api_types import PayloadExecutionStatus, PayloadStatusV1
 from ../eth1/eth1_monitor import
-  Eth1Monitor, asEngineExecutionPayload, ensureDataProvider, newPayload
+  ELManager, asEngineExecutionPayload, sendNewPayload,
+  forkchoiceUpdated, forkchoiceUpdatedNoResult
 
 proc expectValidForkchoiceUpdated(
-    eth1Monitor: Eth1Monitor,
-    headBlockHash, safeBlockHash, finalizedBlockHash: Eth2Digest,
+    elManager: ELManager,
+    headBlockRoot, safeBlockRoot, finalizedBlockRoot: Eth2Digest,
     receivedBlock: ForkySignedBeaconBlock): Future[void] {.async.} =
   let
-    (payloadExecutionStatus, _) = await eth1Monitor.runForkchoiceUpdated(
-      headBlockHash, safeBlockHash, finalizedBlockHash)
-    receivedExecutionBlockHash =
+    (payloadExecutionStatus, _) = await elManager.forkchoiceUpdated(
+      headBlockRoot, safeBlockRoot, finalizedBlockRoot)
+    receivedExecutionBlockRoot =
       when typeof(receivedBlock).toFork >= BeaconBlockFork.Bellatrix:
         receivedBlock.message.body.execution_payload.block_hash
       else:
@@ -206,7 +206,7 @@ proc expectValidForkchoiceUpdated(
   # previous `forkchoiceUpdated` had already marked it as valid. However, if
   # it's not the block that was received, don't info/warn either way given a
   # relative lack of immediate evidence.
-  if receivedExecutionBlockHash != headBlockHash:
+  if receivedExecutionBlockRoot != headBlockRoot:
     return
 
   case payloadExecutionStatus
@@ -215,13 +215,13 @@ proc expectValidForkchoiceUpdated(
     discard
   of PayloadExecutionStatus.accepted, PayloadExecutionStatus.syncing:
     info "execution payload forkChoiceUpdated status ACCEPTED/SYNCING, but was previously VALID",
-      payloadExecutionStatus = $payloadExecutionStatus, headBlockHash,
-      safeBlockHash, finalizedBlockHash,
+      payloadExecutionStatus = $payloadExecutionStatus, headBlockRoot,
+      safeBlockRoot, finalizedBlockRoot,
       receivedBlock = shortLog(receivedBlock)
   of PayloadExecutionStatus.invalid, PayloadExecutionStatus.invalid_block_hash:
     warn "execution payload forkChoiceUpdated status INVALID, but was previously VALID",
-      payloadExecutionStatus = $payloadExecutionStatus, headBlockHash,
-      safeBlockHash, finalizedBlockHash,
+      payloadExecutionStatus = $payloadExecutionStatus, headBlockRoot,
+      safeBlockRoot, finalizedBlockRoot,
       receivedBlock = shortLog(receivedBlock)
 
 from ../consensus_object_pools/attestation_pool import
@@ -238,11 +238,8 @@ from eth/async_utils import awaitWithTimeout
 from ../spec/datatypes/bellatrix import ExecutionPayload, SignedBeaconBlock
 
 proc newExecutionPayload*(
-    eth1Monitor: Eth1Monitor, executionPayload: bellatrix.ExecutionPayload):
+    elManager: ELManager, executionPayload: bellatrix.ExecutionPayload):
     Future[Opt[PayloadExecutionStatus]] {.async.} =
-  if eth1Monitor.isNil:
-    warn "newPayload: attempting to process execution payload without Eth1Monitor. Ensure --web3-url setting is correct and JWT is configured."
-    return Opt.none PayloadExecutionStatus
 
   debug "newPayload: inserting block into execution engine",
     parentHash = executionPayload.parent_hash,
@@ -258,23 +255,9 @@ proc newExecutionPayload*(
     baseFeePerGas = $executionPayload.base_fee_per_gas,
     numTransactions = executionPayload.transactions.len
 
-  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.1/src/engine/specification.md#request
-  const NEWPAYLOAD_TIMEOUT = 8.seconds
-
   try:
-    let
-      payloadResponse =
-        awaitWithTimeout(
-            eth1Monitor.newPayload(
-              executionPayload.asEngineExecutionPayload),
-            NEWPAYLOAD_TIMEOUT):
-          info "newPayload: newPayload timed out"
-          return Opt.none PayloadExecutionStatus
-
-          # Placeholder for type system
-          PayloadStatusV1(status: PayloadExecutionStatus.syncing)
-
-      payloadStatus = payloadResponse.status
+    let payloadStatus = await elManager.sendNewPayload(
+      executionPayload.asEngineExecutionPayload)
 
     debug "newPayload: succeeded",
       parentHash = executionPayload.parent_hash,
@@ -291,21 +274,21 @@ proc newExecutionPayload*(
 from ../spec/datatypes/capella import ExecutionPayload
 
 proc newExecutionPayload*(
-    eth1Monitor: Eth1Monitor, executionPayload: capella.ExecutionPayload):
+    elManager: ELManager, executionPayload: capella.ExecutionPayload):
     Future[Opt[PayloadExecutionStatus]] {.async.} =
   raiseAssert $capellaImplementationMissing
 
 proc getExecutionValidity(
-    eth1Monitor: Eth1Monitor,
+    elManager: ELManager,
     blck: phase0.SignedBeaconBlock | altair.SignedBeaconBlock):
     Future[NewPayloadStatus] {.async.} =
   return NewPayloadStatus.valid   # vacuously
 
 proc getExecutionValidity(
-    eth1Monitor: Eth1Monitor, blck: bellatrix.SignedBeaconBlock):
+    elManager: ELManager, blck: bellatrix.SignedBeaconBlock):
     Future[NewPayloadStatus] {.async.} =
   # Eth1 syncing is asynchronous from this
-  # TODO self.consensusManager.eth1Monitor.ttdReached
+  # TODO self.consensusManager.elManager.ttdReached
   # should gate this when it works more reliably
   # TODO detect have-TTD-but-not-is_execution_block case, and where
   # execution payload was non-zero when TTD detection more reliable
@@ -314,11 +297,8 @@ proc getExecutionValidity(
     return NewPayloadStatus.valid  # vacuously
 
   try:
-    # Minimize window for Eth1 monitor to shut down connection
-    await eth1Monitor.ensureDataProvider()
-
     let executionPayloadStatus = await newExecutionPayload(
-      eth1Monitor, blck.message.body.execution_payload)
+      elManager, blck.message.body.execution_payload)
     if executionPayloadStatus.isNone:
       return NewPayloadStatus.noResponse
 
@@ -340,7 +320,7 @@ proc getExecutionValidity(
 from ../spec/datatypes/capella import SignedBeaconBlock, asTrusted, shortLog
 
 proc getExecutionValidity(
-    eth1Monitor: Eth1Monitor,
+    elManager: ELManager,
     blck: capella.SignedBeaconBlock):
     Future[NewPayloadStatus] {.async.} =
   raiseAssert $capellaImplementationMissing
@@ -360,7 +340,7 @@ proc storeBlock*(
     vm = self.validatorMonitor
     dag = self.consensusManager.dag
     payloadStatus =
-      await self.consensusManager.eth1Monitor.getExecutionValidity(signedBlock)
+      await self.consensusManager.elManager.getExecutionValidity(signedBlock)
     payloadValid = payloadStatus == NewPayloadStatus.valid
 
   # The block is certainly not missing any more
@@ -461,7 +441,7 @@ proc storeBlock*(
         wallSlot.start_beacon_time)
 
   if newHead.isOk:
-    template eth1Monitor(): auto = self.consensusManager.eth1Monitor
+    template elManager(): auto = self.consensusManager.elManager
     if self.consensusManager[].shouldSyncOptimistically(wallSlot):
       # Optimistic head is far in the future; report it as head block to EL.
 
@@ -479,10 +459,10 @@ proc storeBlock*(
       # - "Beacon chain gapped" from DAG head to optimistic head,
       # - followed by "Beacon chain reorged" from optimistic head back to DAG.
       self.consensusManager[].updateHead(newHead.get.blck)
-      asyncSpawn eth1Monitor.runForkchoiceUpdatedDiscardResult(
-        headBlockHash = self.consensusManager[].optimisticExecutionPayloadHash,
-        safeBlockHash = newHead.get.safeExecutionPayloadHash,
-        finalizedBlockHash = newHead.get.finalizedExecutionPayloadHash)
+      asyncSpawn elManager.forkchoiceUpdatedNoResult(
+        headBlock = self.consensusManager[].optimisticExecutionPayloadHash,
+        safeBlock = newHead.get.safeExecutionPayloadHash,
+        finalizedBlock = newHead.get.finalizedExecutionPayloadHash)
     else:
       let
         headExecutionPayloadHash =
@@ -499,10 +479,10 @@ proc storeBlock*(
 
         if self.consensusManager.checkNextProposer(wallSlot).isNone:
           # No attached validator is next proposer, so use non-proposal fcU
-          asyncSpawn eth1Monitor.expectValidForkchoiceUpdated(
-            headBlockHash = headExecutionPayloadHash,
-            safeBlockHash = newHead.get.safeExecutionPayloadHash,
-            finalizedBlockHash = newHead.get.finalizedExecutionPayloadHash,
+          asyncSpawn elManager.expectValidForkchoiceUpdated(
+            headBlockRoot = headExecutionPayloadHash,
+            safeBlockRoot = newHead.get.safeExecutionPayloadHash,
+            finalizedBlockRoot = newHead.get.finalizedExecutionPayloadHash,
             receivedBlock = signedBlock)
         else:
           # Some attached validator is next proposer, so prepare payload. As
